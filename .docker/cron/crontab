@@ -1,0 +1,5 @@
+# Agendamentos do Helpdesk (executados pelo serviço "scheduler" do docker-compose).
+# min  hora dia mês dia-sem  comando
+*      *    *   *   *        /var/www/.docker/cron/run.sh app/Jobs/SendQueuedEmailsJob.php
+*/5    *    *   *   *        /var/www/.docker/cron/run.sh app/Jobs/FetchEmailsJob.php
+*/5    *    *   *   *        /var/www/.docker/cron/run.sh app/Jobs/CheckSlaBreachesJob.php

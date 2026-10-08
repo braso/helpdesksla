@@ -1,0 +1,10 @@
+.env
+.git
+.impeccable
+hub
+intranet_plone
+portalbraso
+storage/attachments/*
+storage/logs/*
+*.zip
+.DS_Store
