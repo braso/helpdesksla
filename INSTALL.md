@@ -5,14 +5,18 @@ Docker e Docker Compose (Docker Desktop no Mac/Windows).
 
 ## Subir
 ```bash
-unzip helpdesk-docker.zip -d helpdesk && cd helpdesk
+unzip helpdesk-docker.zip && cd helpdesk
 docker compose up -d --build
 ```
 > Atualizando uma instalação antiga? Rode `docker compose build && docker compose up -d` para incluir a extensão IMAP e o agendador.
 Aguarde ~30 s na primeira vez (o MySQL cria o banco). Acesse **http://localhost:8080**.
 
-- Usuário inicial: `admin@helpdesk.com` · senha `password` — **troque em Usuários após entrar**.
-- O banco é criado automaticamente a partir de `database/docker-init/` (schema completo + papéis, permissões, SLA padrão e admin). Isso só acontece com o volume `db_data` vazio.
+- O banco é criado automaticamente a partir de `database/docker-init/`, só com o volume `db_data` vazio:
+  - `01_schema.sql` — todas as tabelas (já inclui as migrações até a 009);
+  - `02_seed.sql` — papéis, permissões, SLA padrão (mercado 8x5), perfis de alerta e o admin `admin@helpdesk.com`;
+  - `03_admins.sql` — administradores e configurações da instalação BRASO. Cada admin entra com a senha que já usa; `admin@helpdesk.com` continua com a senha `password` — **troque em Usuários após entrar**.
+- Sobe sem chamados, empresas ou clientes. **Segredos não vão no pacote**: após entrar, informe a senha do SMTP em *Envio de e-mail* e as chaves de IA em *Configurações gerais*.
+- Para recomeçar do zero: `docker compose down -v` (apaga o volume do banco) e `docker compose up -d`.
 
 ## Configuração
 - Variáveis ficam em `docker-compose.yml`. Para produção, **troque `JWT_SECRET`** (`openssl rand -hex 32`) e as senhas do MySQL.

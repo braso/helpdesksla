@@ -257,10 +257,70 @@ final class SlaAlertController
             error_log("[testEmail] {$error}");
         }
 
+        $log = $this->notificationService->lastSmtpLog();
+        if (!$sent && $error !== null && str_contains($error, 'Não foi possível conectar')) {
+            $log = array_merge($log, $this->probePorts($smtp['host'], (int) $smtp['port'], $log ? end($log)['t'] : 0));
+        }
+
         Response::success(
-            data:    ['sent' => $sent, 'to' => $to, 'server' => "{$smtp['host']}:{$smtp['port']}", 'error' => $error ? $this->explainSmtp($error) : null],
+            data:    [
+                'sent'   => $sent,
+                'to'     => $to,
+                'server' => "{$smtp['host']}:{$smtp['port']}",
+                'error'  => $error ? $this->explainSmtp($error) : null,
+                'log'    => $log,
+            ],
             message: $sent ? 'E-mail de teste enviado com sucesso.' : 'O envio de teste falhou.',
         );
+    }
+
+    /**
+     * Quando a conexão falha, testa as outras portas SMTP comuns (só abre e fecha o TCP,
+     * em paralelo, até 4 s) para mostrar qual porta o servidor/rede realmente aceitam.
+     *
+     * @return list<array{t:int, dir:string, text:string}>
+     */
+    private function probePorts(string $host, int $failedPort, int $t): array
+    {
+        $ports   = array_values(array_diff([465, 587, 25, 2525], [$failedPort]));
+        $log     = [['t' => $t, 'dir' => 'info', 'text' => 'Testando outras portas SMTP em ' . $host . ': ' . implode(', ', $ports) . '…']];
+        $pending = [];
+        foreach ($ports as $p) {
+            $s = @stream_socket_client("tcp://{$host}:{$p}", $no, $str, 4, STREAM_CLIENT_CONNECT | STREAM_CLIENT_ASYNC_CONNECT);
+            if ($s !== false) {
+                $pending[$p] = $s;
+            }
+        }
+        $open     = [];
+        $deadline = microtime(true) + 4;
+        while ($pending && ($left = $deadline - microtime(true)) > 0) {
+            $r = null; $w = array_values($pending); $e = null;
+            if (!@stream_select($r, $w, $e, 0, (int) ($left * 1_000_000)) || !$w) {
+                break;
+            }
+            foreach ($w as $s) {
+                $p = array_search($s, $pending, true);
+                // conexão assíncrona "gravável" mas sem par = recusada
+                if (stream_socket_get_name($s, true) !== false) {
+                    $open[] = $p;
+                }
+                fclose($s);
+                unset($pending[$p]);
+            }
+        }
+        foreach ($pending as $s) {
+            fclose($s);
+        }
+        sort($open);
+        foreach ($ports as $p) {
+            $log[] = in_array($p, $open, true)
+                ? ['t' => $t, 'dir' => 'ok',    'text' => "Porta {$p}: aberta" . ($p === 465 ? ' (use criptografia SSL)' : ($p === 587 ? ' (use criptografia TLS)' : ''))]
+                : ['t' => $t, 'dir' => 'error', 'text' => "Porta {$p}: sem resposta ou recusada"];
+        }
+        if (!$open) {
+            $log[] = ['t' => $t, 'dir' => 'warn', 'text' => 'Nenhuma porta respondeu: provável bloqueio de saída na rede/firewall ou endereço do servidor errado.'];
+        }
+        return $log;
     }
 
     /** Traduz respostas SMTP comuns em orientação prática. */
@@ -268,6 +328,7 @@ final class SlaAlertController
     {
         return match (true) {
             str_contains($error, '535')                => "{$error} — usuário ou senha incorretos. Confira a senha da conta de e-mail.",
+            str_contains($error, '435') || str_contains($error, '454') => "{$error} — o servidor recusou a autenticação temporariamente (conta bloqueada, IP não liberado no provedor ou excesso de tentativas). Confira a conta no painel do provedor e tente de novo em alguns minutos.",
             str_contains($error, '550') && str_contains($error, 'destinatário') => "{$error} — o endereço de destino não existe ou não aceita mensagens.",
             str_contains($error, 'getaddrinfo')        => "{$error} — o nome do servidor não foi encontrado. Confira o endereço do SMTP.",
             str_contains($error, 'timed out') || str_contains($error, 'Tempo esgotado') => "{$error} — o servidor não respondeu. Confira porta e criptografia (465 = SSL, 587 = TLS) ou se o firewall libera a saída.",

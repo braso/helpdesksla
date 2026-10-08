@@ -269,6 +269,21 @@ kbd { font-family:var(--mono); font-size:11px; padding:1px 5px; border:1px solid
 .slam.md { --c:9px; --g:2px; }
 .sla-cell { display:flex; align-items:center; gap:9px; white-space:nowrap; }
 .sla-txt { font-size:var(--fs-2); font-weight:600; }
+.smtp-server-row { grid-template-columns:minmax(0,1fr) 120px 150px; gap:12px; margin-bottom:13px; }
+@media (max-width:640px) { .smtp-server-row { grid-template-columns:minmax(0,1fr) minmax(0,1fr); } .smtp-server-row > :first-child { grid-column:1 / -1; } }
+.smtp-log { margin-top:12px; border:1px solid var(--line-2); border-radius:8px; overflow:hidden; }
+.smtp-log-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 12px; background:var(--surface-2); font-size:12px; font-weight:600; color:var(--muted2); flex-wrap:wrap; }
+.smtp-log-body { margin:0; max-height:420px; overflow:auto; background:#0F1B2D; color:#D6DEEA; font:12px/1.55 var(--mono); padding:10px 0; }
+.smtp-log-row { display:grid; grid-template-columns:62px 22px minmax(0,1fr); padding:0 12px; }
+.smtp-log-row span:first-child { color:#6F819B; text-align:right; padding-right:8px; }
+.smtp-log-row span:nth-child(2) { color:#6F819B; }
+.smtp-log-row span:last-child { white-space:pre-wrap; word-break:break-word; }
+.smtp-log-row.out span:last-child { color:#8FC5FF; }
+.smtp-log-row.ok span:last-child { color:#6FDCA6; }
+.smtp-log-row.warn span:last-child { color:#FFC86B; }
+.smtp-log-row.error { background:rgba(255,90,80,.12); }
+.smtp-log-row.error span:last-child { color:#FF9A92; }
+.smtp-log-row.info span:last-child { color:#AEBBCD; }
 .sla-txt.ok { color:var(--ok); } .sla-txt.warn { color:var(--warn); } .sla-txt.bad { color:var(--bad); }
 .sla-txt.done { color:var(--text-2); font-weight:500; } .sla-txt.late { color:var(--bad); font-weight:500; } .sla-txt.none { color:var(--text-3); font-weight:500; }
 .sla-sub { display:block; font-size:var(--fs-1); color:var(--text-3); font-weight:400; }
@@ -4493,7 +4508,7 @@ async function renderSmtpConfig() {
       <div class="card" style="margin-bottom:20px">
         <div class="card-title">Servidor de Envio</div>
 
-        <div class="form-row" style="grid-template-columns:1fr 120px 150px;gap:12px;margin-bottom:13px">
+        <div class="form-row smtp-server-row">
           <div class="form-group" style="margin:0">
             <label>Servidor SMTP</label>
             <input id="smtp-host" type="text" placeholder="smtp.gmail.com" value="${esc(cfg.host||'')}">
@@ -4512,7 +4527,7 @@ async function renderSmtpConfig() {
           </div>
         </div>
 
-        <div class="form-row" style="margin-bottom:13px">
+        <div class="form-row" style="gap:12px;margin-bottom:13px">
           <div class="form-group" style="margin:0">
             <label>Usuário / Login</label>
             <input id="smtp-user" type="text" placeholder="usuario@email.com" value="${esc(cfg.username||'')}">
@@ -4520,6 +4535,13 @@ async function renderSmtpConfig() {
           <div class="form-group" style="margin:0">
             <label>Senha ${cfg.has_password?'<span style="color:var(--green);font-weight:400">(configurada)</span>':''}</label>
             <input id="smtp-pass" type="password" placeholder="${cfg.has_password?'Deixe em branco para manter':'Nova senha'}">
+          </div>
+          <div class="form-group" style="margin:0">
+            <label for="smtp-auth">Autenticação</label>
+            <select id="smtp-auth" title="Método do comando AUTH. O log do teste mostra quais o servidor aceita.">
+              <option value="login" ${cfg.auth!=='plain'?'selected':''}>LOGIN</option>
+              <option value="plain" ${cfg.auth==='plain'?'selected':''}>PLAIN</option>
+            </select>
           </div>
         </div>
 
@@ -4560,6 +4582,7 @@ async function renderSmtpConfig() {
 
         <!-- resultado do teste -->
         <div id="smtp-test-result" style="display:none;margin-top:16px;padding:12px 16px;border-radius:8px;font-size:13px"></div>
+        <div id="smtp-test-log"></div>
 
         <!-- dicas rápidas -->
         <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border)">
@@ -4608,6 +4631,7 @@ async function doSaveSmtp() {
     port:         parseInt(v('smtp-port')) || 587,
     username:     user,
     encryption:   v('smtp-enc'),
+    auth:         v('smtp-auth'),
     from_address: v('smtp-from-addr').trim(),
     from_name:    v('smtp-from-name').trim(),
   };
@@ -4626,6 +4650,9 @@ async function doSaveSmtp() {
   }
 }
 
+const SMTP_LOG_MARK = { out:'→', in:'←', ok:'✓', warn:'!', error:'✕', info:'·' };
+let _smtpLog = [];
+
 async function doTestSmtpSend() {
   const to  = v('smtp-test-to').trim();
   const btn = el('smtp-test-btn');
@@ -4635,15 +4662,17 @@ async function doTestSmtpSend() {
 
   setBtn(btn, 'Enviando…', true);
   res.style.display = 'none';
+  el('smtp-test-log').innerHTML = '';
 
   try {
     const r = await api.testSmtpEmail({ to });
+    renderSmtpLog(r.data.log || [], r.data);
     if (!r.data.sent) throw { data:{ message: r.data.error || r.message } };
     res.style.display      = 'block';
     res.style.background   = 'var(--ok-soft)';
     res.style.border       = '1px solid #B8E0CC';
     res.style.color        = 'var(--green)';
-    res.innerHTML = `<strong>Sucesso!</strong> E-mail enviado para <strong>${esc(to)}</strong> por ${esc(r.data.server || '')}. Verifique sua caixa de entrada.`;
+    res.innerHTML = `<strong>Sucesso!</strong> E-mail enviado para <strong>${esc(to)}</strong> por ${esc(r.data.server || '')}. Verifique sua caixa de entrada (e o spam).`;
   } catch(e) {
     const msg = e.data?.message || 'Falha ao enviar e-mail.';
     res.style.display      = 'block';
@@ -4654,6 +4683,33 @@ async function doTestSmtpSend() {
   } finally {
     setBtn(btn, 'Enviar e-mail de teste', false);
   }
+}
+
+function renderSmtpLog(log, data) {
+  _smtpLog = log;
+  const box = el('smtp-test-log');
+  if (!log.length) { box.innerHTML = ''; return; }
+  const total = log[log.length - 1].t;
+  box.innerHTML = `
+    <div class="smtp-log">
+      <div class="smtp-log-head">
+        <span>Log do envio · ${esc(data.server || '')} · ${data.sent ? 'aceito' : 'falhou'} em ${(total/1000).toLocaleString('pt-BR',{maximumFractionDigits:2})} s</span>
+        <button class="btn btn-ghost btn-sm" type="button" onclick="copySmtpLog()">Copiar log</button>
+      </div>
+      <div class="smtp-log-body" role="log">${log.map(l => `
+        <div class="smtp-log-row ${esc(l.dir)}"><span>${l.t} ms</span><span>${SMTP_LOG_MARK[l.dir] || '·'}</span><span>${esc(l.text)}</span></div>`).join('')}
+      </div>
+    </div>`;
+  const body = box.querySelector('.smtp-log-body');
+  const err  = body.querySelector('.smtp-log-row.error');
+  if (err) body.scrollTop = Math.max(0, err.offsetTop - body.clientHeight / 2);
+}
+
+async function copySmtpLog() {
+  const text = `Teste SMTP — ${new Date().toLocaleString('pt-BR')}\n` +
+    _smtpLog.map(l => `${String(l.t).padStart(6)} ms ${SMTP_LOG_MARK[l.dir] || '·'} ${l.text}`).join('\n');
+  try { await navigator.clipboard.writeText(text); toast('Log copiado.', 'success'); }
+  catch { toast('Não foi possível copiar. Selecione o texto do log manualmente.', 'error'); }
 }
 
 function fillSmtpHint(host, port, enc) {

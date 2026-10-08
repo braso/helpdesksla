@@ -7,3 +7,5 @@ storage/logs/*
 .DS_Store
 .idea/
 .vscode/
+# admins reais da instalação (hashes de senha) — não versionar
+database/docker-init/03_admins.sql

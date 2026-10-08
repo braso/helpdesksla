@@ -333,6 +333,27 @@ final class NotificationService
 
     // ─── SMTP privado ─────────────────────────────────────────────────────────
 
+    /** @var list<array{t:int, dir:string, text:string}> diálogo do último envio SMTP (para diagnóstico) */
+    private array $smtpLog = [];
+    private float $smtpStart = 0.0;
+
+    /**
+     * Log do último envio SMTP: DNS, conexão, TLS, certificado e cada comando/resposta,
+     * com a senha mascarada e o corpo da mensagem resumido.
+     * `dir`: info | out (cliente → servidor) | in (servidor → cliente) | ok | warn | error.
+     *
+     * @return list<array{t:int, dir:string, text:string}>
+     */
+    public function lastSmtpLog(): array
+    {
+        return $this->smtpLog;
+    }
+
+    private function slog(string $dir, string $text): void
+    {
+        $this->smtpLog[] = ['t' => (int) round((microtime(true) - $this->smtpStart) * 1000), 'dir' => $dir, 'text' => $text];
+    }
+
     private function sendSmtp(
         string $toEmail,
         string $toName,
@@ -347,38 +368,84 @@ final class NotificationService
         $username   = $cfg['username'];
         $password   = $cfg['password'];
         $encryption = $cfg['encryption'];
+        $auth       = $cfg['auth'];
+
+        $this->smtpLog   = [];
+        $this->smtpStart = microtime(true);
 
         // Porta 465 sempre exige SSL direto, independente da variável MAIL_ENCRYPTION
         $useSmtps = $encryption === 'ssl' || $port === 465;
-        $prefix   = $useSmtps ? 'ssl://' : '';
+        $prefix   = $useSmtps ? 'ssl://' : 'tcp://';
 
-        $socket = @fsockopen("{$prefix}{$host}", $port, $errno, $errstr, 10);
+        $mode = $useSmtps ? 'SSL direto (SMTPS)' : ($encryption === 'tls' ? 'STARTTLS' : 'sem criptografia');
+        if ($useSmtps && $encryption !== 'ssl') {
+            $mode .= ' — forçado pela porta 465';
+        }
+        $this->slog('info', "Servidor {$host}:{$port} · criptografia: {$mode}");
+        $this->slog('info', $username !== '' ? 'Autenticação ' . strtoupper($auth) . " como {$username}" : 'Sem autenticação (usuário em branco)');
+        $this->slog('info', "Remetente <{$fromAddress}> → destinatário <{$toEmail}>");
+
+        if (filter_var($host, FILTER_VALIDATE_IP) === false) {
+            $t0  = microtime(true);
+            $ips = @gethostbynamel($host);
+            $ms  = (int) round((microtime(true) - $t0) * 1000);
+            if ($ips === false) {
+                $this->slog('error', "DNS: o nome {$host} não foi encontrado ({$ms} ms)");
+            } else {
+                $this->slog('ok', "DNS: {$host} → " . implode(', ', $ips) . " ({$ms} ms)");
+            }
+        }
+
+        $context = stream_context_create(['ssl' => ['capture_peer_cert' => true, 'SNI_enabled' => true, 'peer_name' => $host]]);
+        $this->slog('info', "Conectando a {$prefix}{$host}:{$port} (limite de 10 s)…");
+        $t0     = microtime(true);
+        $socket = @stream_socket_client("{$prefix}{$host}:{$port}", $errno, $errstr, 10, STREAM_CLIENT_CONNECT, $context);
+        $ms     = (int) round((microtime(true) - $t0) * 1000);
         if ($socket === false) {
-            throw new \RuntimeException("Não foi possível conectar ao SMTP {$host}:{$port}: {$errstr} ({$errno})");
+            $reason = $errstr !== '' ? $errstr : (error_get_last()['message'] ?? 'erro desconhecido');
+            $this->slog('error', "Conexão falhou após {$ms} ms: {$reason} ({$errno})");
+            throw new \RuntimeException("Não foi possível conectar ao SMTP {$host}:{$port}: {$reason} ({$errno})");
+        }
+        $peer  = stream_socket_get_name($socket, true) ?: '?';
+        $local = stream_socket_get_name($socket, false) ?: '?';
+        $this->slog('ok', "Conectado em {$ms} ms ({$local} → {$peer})");
+        if ($useSmtps) {
+            $this->logTls($socket);
         }
         stream_set_timeout($socket, 15);
 
         // Lê a resposta completa: linhas "250-..." continuam, "250 ..." encerra.
-        $read = static function () use ($socket): array {
+        $read = function () use ($socket): array {
             $text = '';
             while (true) {
                 $line = fgets($socket, 1024);
                 if ($line === false) {
                     $meta = stream_get_meta_data($socket);
-                    throw new \RuntimeException($meta['timed_out'] ? 'Tempo esgotado aguardando o servidor SMTP.' : 'O servidor SMTP encerrou a conexão.');
+                    $msg  = $meta['timed_out'] ? 'Tempo esgotado aguardando o servidor SMTP.' : 'O servidor SMTP encerrou a conexão.';
+                    $this->slog('error', $msg);
+                    throw new \RuntimeException($msg);
                 }
+                $clean = rtrim($line, "\r\n");
+                // Desafios do AUTH LOGIN vêm em base64 ("VXNlcm5hbWU6" = "Username:")
+                if (preg_match('/^334 ([A-Za-z0-9+\/=]+)$/', $clean, $m) && ($dec = base64_decode($m[1], true)) !== false && ctype_print($dec)) {
+                    $clean .= "  [{$dec}]";
+                }
+                $this->slog('in', $clean);
                 $text .= $line;
                 if (strlen($line) < 4 || $line[3] !== '-') {
                     return [(int) substr($line, 0, 3), trim($text)];
                 }
             }
         };
-        $expect = static function (array $resp, array $codes, string $step): void {
+        $expect = function (array $resp, array $codes, string $step): void {
             if (!in_array($resp[0], $codes, true)) {
+                $this->slog('error', "Resposta inesperada para {$step} (esperado " . implode('/', $codes) . ", recebido {$resp[0]})");
                 throw new \RuntimeException("SMTP recusou {$step}: {$resp[1]}");
             }
         };
-        $send = static function (string $cmd) use ($socket, $read): array {
+        // $shown: o que aparece no log no lugar do comando real (senha, corpo da mensagem)
+        $send = function (string $cmd, ?string $shown = null) use ($socket, $read): array {
+            $this->slog('out', $shown ?? $cmd);
             fwrite($socket, $cmd . "\r\n");
             return $read();
         };
@@ -386,20 +453,49 @@ final class NotificationService
         try {
             $expect($read(), [220], 'a conexão');
             $ehlo = 'EHLO ' . (gethostname() ?: 'helpdesk');
-            $expect($send($ehlo), [250], 'o EHLO');
+            $resp = $send($ehlo);
+            $expect($resp, [250], 'o EHLO');
 
             if (!$useSmtps && $encryption === 'tls') {
+                if (stripos($resp[1], 'STARTTLS') === false) {
+                    $this->slog('warn', 'O servidor não anunciou STARTTLS no EHLO; tentando mesmo assim.');
+                }
                 $expect($send('STARTTLS'), [220], 'o STARTTLS');
                 if (!stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLS_CLIENT)) {
+                    $this->slog('error', 'Falha na negociação TLS: ' . (error_get_last()['message'] ?? 'motivo não informado'));
                     throw new \RuntimeException('Falha ao negociar TLS com o servidor SMTP.');
                 }
-                $expect($send($ehlo), [250], 'o EHLO após TLS');
+                $this->logTls($socket);
+                $resp = $send($ehlo);
+                $expect($resp, [250], 'o EHLO após TLS');
+            } elseif (!$useSmtps) {
+                $this->slog('warn', $username !== '' ? 'Conexão sem criptografia: usuário e senha trafegam em texto aberto.' : 'Conexão sem criptografia.');
             }
 
             if ($username !== '') {
-                $expect($send('AUTH LOGIN'), [334], 'a autenticação');
-                $expect($send(base64_encode($username)), [334], 'o usuário');
-                $expect($send(base64_encode($password)), [235], 'a senha (verifique usuário e senha)');
+                $method = strtoupper($auth);
+                if (preg_match('/^250[ -]AUTH[ =](.+)$/mi', $resp[1], $m)) {
+                    $offered = preg_split('/\s+/', strtoupper(trim($m[1]))) ?: [];
+                    $this->slog('info', 'Métodos de autenticação aceitos: ' . implode(' ', $offered));
+                    if (!in_array($method, $offered, true)) {
+                        $alt = $method === 'LOGIN' ? 'PLAIN' : 'LOGIN';
+                        $this->slog('warn', "O servidor não anuncia AUTH {$method}, o método configurado."
+                            . (in_array($alt, $offered, true) ? " Experimente {$alt} na configuração." : ''));
+                    }
+                } else {
+                    $this->slog('warn', 'O servidor não anunciou métodos de autenticação (AUTH) no EHLO.');
+                }
+
+                if ($auth === 'plain') {
+                    // RFC 4616: base64("\0usuário\0senha") em um único comando
+                    $expect($send('AUTH PLAIN ' . base64_encode("\0{$username}\0{$password}"),
+                        'AUTH PLAIN ********  [usuário ' . $username . ' e senha oculta, ' . strlen($password) . ' caracteres]'),
+                        [235], 'a autenticação PLAIN (verifique usuário e senha)');
+                } else {
+                    $expect($send('AUTH LOGIN'), [334], 'a autenticação');
+                    $expect($send(base64_encode($username), base64_encode($username) . "  [usuário: {$username}]"), [334], 'o usuário');
+                    $expect($send(base64_encode($password), '********  [senha oculta, ' . strlen($password) . ' caracteres]'), [235], 'a senha (verifique usuário e senha)');
+                }
             }
 
             $expect($send("MAIL FROM:<{$fromAddress}>"), [250], 'o remetente');
@@ -408,11 +504,12 @@ final class NotificationService
 
             $domain   = substr(strrchr($fromAddress, '@') ?: '@helpdesk.local', 1);
             $boundary = 'b' . bin2hex(random_bytes(12));
+            $msgId    = bin2hex(random_bytes(10)) . "@{$domain}";
             $text     = trim(html_entity_decode(strip_tags(preg_replace(['/<(br|\/p|\/tr|\/h[1-6]|\/div|\/li|\/table|\/blockquote)[^>]*>/i', '/<\/td>/i'], ["\n", ' '], $htmlBody) ?? $htmlBody), ENT_QUOTES, 'UTF-8'));
             $text     = preg_replace("/\n\s*\n\s*\n+/", "\n\n", $text) ?? $text;
 
             $message  = 'Date: ' . date('r') . "\r\n";
-            $message .= 'Message-ID: <' . bin2hex(random_bytes(10)) . "@{$domain}>\r\n";
+            $message .= "Message-ID: <{$msgId}>\r\n";
             $message .= 'From: =?UTF-8?B?' . base64_encode($fromName) . "?= <{$fromAddress}>\r\n";
             $message .= 'To: =?UTF-8?B?' . base64_encode($toName) . "?= <{$toEmail}>\r\n";
             $message .= 'Subject: =?UTF-8?B?' . base64_encode($subject) . "?=\r\n";
@@ -424,11 +521,38 @@ final class NotificationService
             $message .= chunk_split(base64_encode($htmlBody)) . "\r\n";
             $message .= "--{$boundary}--\r\n.";
 
-            $expect($send($message), [250], 'a mensagem');
+            $size = number_format(strlen($message) / 1024, 1, ',', '.');
+            $expect($send($message, "[mensagem: {$size} KB · assunto \"{$subject}\" · Message-ID <{$msgId}>]"), [250], 'a mensagem');
+            $this->slog('ok', 'Mensagem aceita pelo servidor. A entrega na caixa do destinatário depende dele a partir daqui.');
             try { $send('QUIT'); } catch (\Throwable) {}
             return true;
         } finally {
             fclose($socket);
+        }
+    }
+
+    /** Registra no log o protocolo/cifra negociados e os dados do certificado do servidor. */
+    private function logTls($socket): void
+    {
+        $crypto = stream_get_meta_data($socket)['crypto'] ?? [];
+        if ($crypto) {
+            $this->slog('ok', sprintf('TLS: %s · cifra %s (%d bits)', $crypto['protocol'] ?? '?', $crypto['cipher_name'] ?? '?', $crypto['cipher_bits'] ?? 0));
+        }
+        $cert = stream_context_get_params($socket)['options']['ssl']['peer_certificate'] ?? null;
+        $info = $cert ? openssl_x509_parse($cert) : false;
+        if (!$info) {
+            return;
+        }
+        $issuer = $info['issuer']['O'] ?? $info['issuer']['CN'] ?? '?';
+        $until  = isset($info['validTo_time_t']) ? date('d/m/Y', $info['validTo_time_t']) : '?';
+        $days   = isset($info['validTo_time_t']) ? (int) floor(($info['validTo_time_t'] - time()) / 86400) : null;
+        $names  = str_replace('DNS:', '', $info['extensions']['subjectAltName'] ?? '');
+        $this->slog('info', sprintf('Certificado: %s · emitido por %s · válido até %s%s', $info['subject']['CN'] ?? '?', $issuer, $until, $days !== null ? " ({$days} dias)" : ''));
+        if ($names !== '') {
+            $this->slog('info', 'Nomes do certificado: ' . $names);
+        }
+        if ($days !== null && $days < 15) {
+            $this->slog('warn', $days < 0 ? 'O certificado do servidor está vencido.' : "O certificado do servidor vence em {$days} dias.");
         }
     }
 
@@ -460,7 +584,7 @@ final class NotificationService
             $stmt = $this->connection->pdo()->prepare(
                 "SELECT `key`, `value` FROM system_settings
                   WHERE `key` IN ('mail_host','mail_port','mail_username','mail_password',
-                                  'mail_encryption','mail_from_address','mail_from_name')"
+                                  'mail_encryption','mail_auth','mail_from_address','mail_from_name')"
             );
             $stmt->execute();
             $db = $stmt->fetchAll(\PDO::FETCH_KEY_PAIR) ?: [];
@@ -474,6 +598,7 @@ final class NotificationService
             'username'     => $db['mail_username']     ?? ($_ENV['MAIL_USERNAME']      ?? ''),
             'password'     => $db['mail_password']     ?? ($_ENV['MAIL_PASSWORD']      ?? ''),
             'encryption'   => strtolower($db['mail_encryption']   ?? ($_ENV['MAIL_ENCRYPTION']   ?? 'tls')),
+            'auth'         => strtolower($db['mail_auth']         ?? ($_ENV['MAIL_AUTH']         ?? 'login')) === 'plain' ? 'plain' : 'login',
             'from_address' => $db['mail_from_address'] ?? ($_ENV['MAIL_FROM_ADDRESS']  ?? 'helpdesk@sistema.local'),
             'from_name'    => $db['mail_from_name']    ?? ($_ENV['MAIL_FROM_NAME']     ?? 'Helpdesk'),
         ];

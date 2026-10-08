@@ -19,7 +19,7 @@ final class SettingsController
 {
     private const SMTP_KEYS = [
         'mail_host', 'mail_port', 'mail_username', 'mail_password',
-        'mail_encryption', 'mail_from_address', 'mail_from_name',
+        'mail_encryption', 'mail_auth', 'mail_from_address', 'mail_from_name',
     ];
 
     public function __construct(private readonly Connection $connection) {}
@@ -35,6 +35,7 @@ final class SettingsController
                 'port'         => (int) ($stored['mail_port']  ?? ($_ENV['MAIL_PORT']          ?? 587)),
                 'username'     => $stored['mail_username']     ?? ($_ENV['MAIL_USERNAME']      ?? ''),
                 'encryption'   => $stored['mail_encryption']   ?? ($_ENV['MAIL_ENCRYPTION']    ?? 'tls'),
+                'auth'         => strtolower($stored['mail_auth'] ?? ($_ENV['MAIL_AUTH'] ?? 'login')),
                 'from_address' => $stored['mail_from_address'] ?? ($_ENV['MAIL_FROM_ADDRESS']  ?? ''),
                 'from_name'    => $stored['mail_from_name']    ?? ($_ENV['MAIL_FROM_NAME']     ?? 'Helpdesk'),
                 'has_password' => isset($stored['mail_password'])
@@ -59,6 +60,11 @@ final class SettingsController
             Response::error('encryption deve ser tls, ssl ou none.', statusCode: 422);
         }
 
+        $auth = strtolower(trim((string) ($body['auth'] ?? 'login')));
+        if (!in_array($auth, ['login', 'plain'], true)) {
+            Response::error('auth deve ser login ou plain.', statusCode: 422);
+        }
+
         $port = (int) ($body['port'] ?? 587);
         if ($port < 1 || $port > 65535) {
             Response::error('Porta inválida.', statusCode: 422);
@@ -73,6 +79,7 @@ final class SettingsController
                 'mail_port'         => (string) $port,
                 'mail_username'     => trim((string) ($body['username']     ?? '')),
                 'mail_encryption'   => $encryption,
+                'mail_auth'         => $auth,
                 'mail_from_address' => trim((string) ($body['from_address'] ?? '')),
                 'mail_from_name'    => trim((string) ($body['from_name']    ?? 'Helpdesk')),
             ];
